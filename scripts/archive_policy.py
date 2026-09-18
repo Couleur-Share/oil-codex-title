@@ -68,7 +68,7 @@ def automation_protection():
 
 def save_guards(root, host, current_id=None):
     """宿主 list_threads 的新鲜快照；置顶列表始终完整，不依赖普通列表分页。"""
-    if not isinstance(host.get("pinnedThreads"), list) or not isinstance(host.get("threads"), list):
+    if not isinstance(host, dict) or not isinstance(host.get("pinnedThreads"), list) or not isinstance(host.get("threads"), list):
         raise ValueError("需要宿主 list_threads 的完整 JSON")
     if host.get("unavailableHosts") or host.get("unavailableSources"):
         raise ValueError("宿主列表不完整，停止归档扫描")
@@ -350,6 +350,8 @@ def main():
     p.add_argument("--live", action="store_true", help="允许独立模型评估新候选，消耗额度")
     p.add_argument("--limit", type=int, default=10)
     p.add_argument("--scheduled", action="store_true", help="定时入口；归档开关关闭时不评估")
+    p.add_argument("--guards-stdin", action="store_true", help="先从 stdin 保存新鲜宿主名单，再在同一调用内扫描")
+    p.add_argument("--current-id", default=os.environ.get("CODEX_THREAD_ID"))
     for name in ("check", "record", "protect", "release"):
         sub.add_parser(name).add_argument("thread_id")
     for name in ("enable", "pause", "status"):
@@ -379,13 +381,18 @@ def main():
                     state = {}  # 只解除本插件记录；不恢复、不启动原任务。
                 atomic_json(path, state)
             result = {"status": args.command}
+        elif args.command == "scan" and args.scheduled and not policy(root)["enabled"]:
+            result = {"status": "disabled", "enabled": False, "counts": {}, "candidates": []}
         else:
+            if args.command == "scan":
+                if not 0 <= args.limit <= 20:
+                    raise ValueError("单次模型评估数量必须在 0～20 之间")
+                if args.guards_stdin:
+                    save_guards(root, json.load(sys.stdin), args.current_id)
             config = load_config(root)
             binary = find_codex(config["codex_bin"])
             with CodexBackend(binary) as backend:
                 if args.command == "scan":
-                    if not 0 <= args.limit <= 20:
-                        raise ValueError("单次模型评估数量必须在 0～20 之间")
                     fn = (lambda context, **kw: classify(binary, root, config, context, **kw)) if args.live else None
                     result = scan(backend, root, fn, args.limit, scheduled=args.scheduled)
                 elif args.command == "check":

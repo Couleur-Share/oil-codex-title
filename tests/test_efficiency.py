@@ -1,6 +1,7 @@
 """从真实命名/归档入口验证省调用、失败记账与扫描预算，不调用外部模型。"""
 import copy
 import json
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -230,6 +231,45 @@ class EfficiencyTests(unittest.TestCase):
     def test_usage_parser_tolerates_noise_and_rejects_invalid_fields(self):
         raw = '\n'.join(['noise', 'null', json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': -1, 'output_tokens': True}}), json.dumps({'type': 'turn.completed', 'usage': USAGE})])
         self.assertEqual(parse_usage(raw), (USAGE, False))
+
+    def run_archive_cli(self, host, enabled=True):
+        title.atomic_json(self.root / 'archive/config.json', {'enabled': enabled})
+        output = io.StringIO()
+        backend = archive_fixtures.Backend()
+        with patch.dict(os.environ, {'CODEX_HOME': str(self.root / 'codex')}), \
+             patch.object(archive, 'data_dir', return_value=self.root), \
+             patch.object(archive, 'find_codex', return_value='unused') as binary, \
+             patch.object(archive, 'CodexBackend') as factory, \
+             patch.object(sys, 'argv', ['archive', 'scan', '--scheduled', '--guards-stdin', '--current-id', ID, '--limit', '0']), \
+             patch.object(sys, 'stdin', io.StringIO(json.dumps(host))), patch.object(sys, 'stdout', output):
+            factory.return_value.__enter__.return_value = backend
+            code = archive.main()
+        return code, json.loads(output.getvalue()), binary
+
+    def test_combined_guard_scan_returns_real_fresh_report(self):
+        title.atomic_json(self.root / 'archive/preview.json', {'created_at': 1, 'counts': {'listed': 999}})
+        code, report, _ = self.run_archive_cli({'pinnedThreads': [], 'threads': []})
+        self.assertEqual(code, 0)
+        self.assertEqual(report['status'], 'preview')
+        self.assertGreater(report['created_at'], 1)
+        self.assertEqual(report['counts'], {'listed': 1, 'protected': 1})
+        self.assertEqual(report, title.read_json(self.root / 'archive/preview.json'))
+        self.assertIn(ID, title.read_json(self.root / 'archive/guards.json')['protected_ids'])
+
+    def test_combined_scan_rejects_bad_or_incomplete_host_before_backend(self):
+        for host in ([], {}, {'pinnedThreads': [], 'threads': [], 'unavailableHosts': ['local']}):
+            with self.subTest(host=host):
+                code, report, binary = self.run_archive_cli(host)
+                self.assertEqual(code, 1)
+                self.assertEqual(report['status'], 'error')
+                binary.assert_not_called()
+
+    def test_disabled_combined_scan_needs_no_host_or_backend(self):
+        code, report, binary = self.run_archive_cli(None, enabled=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(report['status'], 'disabled')
+        binary.assert_not_called()
+        self.assertFalse((self.root / 'archive/guards.json').exists())
 
 
 if __name__ == '__main__':
