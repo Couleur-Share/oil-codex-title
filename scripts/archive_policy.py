@@ -11,6 +11,7 @@ import re
 import sys
 import time
 
+from usage_ledger import usage_scope
 from codex_adapter import BackendError, ModelSkipped, CodexBackend, find_codex, generate_json
 from oil_codex_title import (ROOT, atomic_json, data_dir, load_config, read_json,
                              item_text, project_hint, state_path, thread_lock, valid_id, worker_slot)
@@ -168,7 +169,11 @@ def eligible(classification, age, cfg):
             or (classification == "no_pending" and age >= cfg["inactive_days"] * DAY))
 
 
-def classify(binary, root, config, context, *, before_model=None):
+def classify(binary, root, config, context, *, before_model=None, timeout_seconds=None):
+    timeout = config["model_timeout_seconds"]
+    if timeout_seconds is not None:
+        timeout = min(timeout, timeout_seconds)
+    config = {**config, "model_timeout_seconds": timeout}
     deadline = time.monotonic() + config["model_timeout_seconds"]
     with worker_slot(root, config["max_parallel_workers"], config["model_timeout_seconds"]) as acquired:
         remaining = deadline - time.monotonic()
@@ -178,8 +183,9 @@ def classify(binary, root, config, context, *, before_model=None):
                              ROOT / "prompts/archiving.md", SCHEMA, before_model=before_model)
 
 
-def scan(backend, root, classifier=None, max_evaluations=10, *, scheduled=False):
+def scan(backend, root, classifier=None, max_evaluations=10, *, scheduled=False, budget_seconds=150):
     """预览也持久化评估缓存；同一内容版本只尝试一次模型，失败不自动重试。"""
+    deadline = time.monotonic() + budget_seconds
     now = time.time()
     cfg = policy(root)
     if scheduled and not cfg["enabled"]:
@@ -196,6 +202,9 @@ def scan(backend, root, classifier=None, max_evaluations=10, *, scheduled=False)
         if not acquired:
             return {"status": "busy"}
         for meta in backend.list_threads(archived=False):
+            if time.monotonic() >= deadline:
+                counts["budget_exhausted"] += 1
+                break
             try:
                 ensure_scan_active()
             except ModelSkipped:
@@ -237,6 +246,8 @@ def scan(backend, root, classifier=None, max_evaluations=10, *, scheduled=False)
                         continue
                     def before_model():
                         ensure_scan_active()
+                        if time.monotonic() >= deadline:
+                            raise ModelSkipped("budget_exhausted")
                         if backend.is_archived(tid, thread.get("cwd")):
                             raise ModelSkipped("archived")
                         fresh = backend.read(tid)
@@ -253,20 +264,24 @@ def scan(backend, root, classifier=None, max_evaluations=10, *, scheduled=False)
                              "reason": "评估未完成，自动保留；需要时可显式重新评估", "evaluated_at": now}
                     atomic_json(record_path(root, tid), state)
                     counts["model_attempts"] += 1
-                    result, usage = classifier(context, before_model=before_model)
-                    ensure_scan_active()
-                    if (not isinstance(result, dict) or set(result) != {"classification", "reason"}
-                            or result["classification"] not in SCHEMA["properties"]["classification"]["enum"]
-                            or not isinstance(result["reason"], str)):
-                        raise ValueError("归档评估输出无效")
-                    fresh = backend.read(tid)
-                    fresh_info = activity(fresh)
-                    if (protected(fresh, tid, cfg, guard, root) or not fresh_info
-                            or fresh_info[1] != fingerprint or backend.is_archived(tid, fresh.get("cwd"))):
-                        counts["stale"] += 1
-                        continue
-                    state.update(classification=result["classification"], reason=result["reason"][:200], usage=usage)
-                    atomic_json(record_path(root, tid), state)
+                    with usage_scope(root, "archiving", tid) as accounting:
+                        result, usage = classifier(context, before_model=before_model,
+                                timeout_seconds=max(0, deadline - time.monotonic()))
+                        ensure_scan_active()
+                        if (not isinstance(result, dict) or set(result) != {"classification", "reason"}
+                                or result["classification"] not in SCHEMA["properties"]["classification"]["enum"]
+                                or not isinstance(result["reason"], str)):
+                            raise ValueError("归档评估输出无效")
+                        fresh = backend.read(tid)
+                        fresh_info = activity(fresh)
+                        if (protected(fresh, tid, cfg, guard, root) or not fresh_info
+                                or fresh_info[1] != fingerprint or backend.is_archived(tid, fresh.get("cwd"))):
+                            accounting.outcome = "stale"
+                            counts["stale"] += 1
+                            continue
+                        state.update(classification=result["classification"], reason=result["reason"][:200], usage=usage)
+                        atomic_json(record_path(root, tid), state)
+                        accounting.outcome = "evaluated"
                 if eligible(state.get("classification"), age, cfg):
                     candidates.append({"id": tid, "title": thread.get("name") or "", "fingerprint": fingerprint,
                                        "idle_days": int(age / DAY), "reason": state["reason"]})
@@ -277,6 +292,8 @@ def scan(backend, root, classifier=None, max_evaluations=10, *, scheduled=False)
                     stopped = True
                     break
                 counts[exc.status] += 1
+                if exc.status == "budget_exhausted":
+                    break
             except (BackendError, ValueError, OSError):
                 counts["errors"] += 1
         report = {"status": "disabled" if stopped else "preview", "created_at": now,

@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+from usage_ledger import begin_attempt, parse_usage
 
 
 class BackendError(RuntimeError):
@@ -265,27 +266,33 @@ def generate_json(binary, config, context, policy, output_schema, *, before_mode
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise BackendError("状态复核已耗尽本次模型时间预算")
+        attempt = begin_attempt(config)
+        usage, status = {}, "interrupted"
         try:
             proc = subprocess.run(args, input=json.dumps(context, ensure_ascii=False),
                                   capture_output=True, encoding="utf-8", env=worker_env(),
                                   timeout=remaining, **process_options())
-        except subprocess.TimeoutExpired as exc:
-            raise BackendError("独立命名模型超时；原标题保留") from exc
-        if proc.returncode or not output.exists():
-            raise BackendError("独立命名模型失败；请检查登录、模型配置和 doctor")
-        result = json.loads(output.read_text(encoding="utf-8"))
-        usage = {}
-        for line in proc.stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue
-            if event.get("type") == "turn.completed":
-                usage = event.get("usage", {})
-            item = event.get("item", {})
-            if item.get("type") in {"command_execution", "mcp_tool_call", "web_search"}:
+            usage, forbidden_tool = parse_usage(proc.stdout)
+            status = "process_error"
+            if proc.returncode or not output.exists():
+                raise BackendError("独立命名模型失败；请检查登录、模型配置和 doctor")
+            status = "rejected_tool"
+            if forbidden_tool:
                 raise BackendError("命名模型尝试调用工具，本次结果已丢弃")
-        return result, usage
+            status = "invalid_json"
+            result = json.loads(output.read_text(encoding="utf-8"))
+            status = "completed"
+            return result, usage
+        except subprocess.TimeoutExpired as exc:
+            usage, _ = parse_usage(exc.stdout)
+            status = "timeout"
+            raise BackendError("独立命名模型超时；原标题保留") from exc
+        except OSError:
+            status = "process_error"
+            raise
+        finally:
+            if attempt:
+                attempt.finish(status, usage)
 
 
 def generate_title(binary, config, context, plugin_root, *, before_model=None):

@@ -18,6 +18,7 @@ import uuid
 
 from codex_adapter import BackendError, ModelSkipped, CodexBackend, find_codex, generate_title, process_options
 import file_lock
+from usage_ledger import usage_scope, usage_report
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULTS = {
@@ -31,7 +32,7 @@ DEFAULTS = {
     "max_parallel_workers": 2,
 }
 EMOJI = ("🎬", "🧩", "🔎", "📝", "📅", "🎨", "⚙️", "💬")
-POLICY_VERSION = 7
+POLICY_VERSION = 8
 
 
 def data_dir():
@@ -298,7 +299,50 @@ def validate_candidate(candidate, current_title):
     return {**candidate, "reason": candidate["reason"][:300]}
 
 
+def confirmation_only(thread, state, config):
+    """仅在基线仍一致时跳过最多两轮纯确认；附件、遗漏轮次或规则升级均重新判断。"""
+    if state.get("policy_version") != POLICY_VERSION or not state.get("last_fingerprint"):
+        return 0
+    current = thread.get("name") or ""
+    try:
+        validate_candidate({"action": "rename", "title": current, "reason": ""}, current)
+    except ValueError:
+        return 0
+    turns = thread.get("turns", [])
+    index = next((i for i, t in enumerate(turns) if t["id"] == state.get("last_turn_id")), None)
+    if index is None:
+        return 0
+    pending = turns[index + 1:]
+    if not pending or len(pending) + state.get("confirmation_skips", 0) > 2:
+        return 0
+    if snapshot({**thread, "turns": turns[:index + 1]}, config)["fingerprint"] != state["last_fingerprint"]:
+        return 0
+    allowed = {"好", "好的", "可以", "收到", "谢谢", "继续", "ok", "okay", "thanks", "thank you", "continue"}
+    for turn in pending:
+        if turn.get("status") != "completed" or turn.get("itemsView", "full") != "full":
+            return 0
+        users = [m for m in turn.get("items", []) if m.get("type") == "userMessage"]
+        if not users:
+            return 0
+        for message in users:
+            parts = message.get("content", [])
+            if not parts or any(p.get("type") != "text" for p in parts):
+                return 0
+            # 检查原始消息，不让宿主包装清理器吞掉附件说明或额外需求。
+            raw = "\n".join(p.get("text", "") for p in parts)
+            if raw.strip(" \t\r\n.!。！").casefold() not in allowed:
+                return 0
+    return len(pending)
+
+
 def process_thread(backend, generator, thread_id, root, config, *, apply=False, event_turn=None):
+    with usage_scope(root, "naming", thread_id) as accounting:
+        result = _process_thread(backend, generator, thread_id, root, config, apply=apply, event_turn=event_turn)
+        accounting.outcome = result["status"]
+        return result
+
+
+def _process_thread(backend, generator, thread_id, root, config, *, apply=False, event_turn=None):
     thread_id = valid_id(thread_id)
     if not config["enabled"]:
         return {"status": "disabled"}
@@ -343,9 +387,13 @@ def process_thread(backend, generator, thread_id, root, config, *, apply=False, 
             return {"status": "manual_title", "title": before["title"]}
         if state.get("last_fingerprint") == before["fingerprint"]:
             return {"status": "unchanged", "title": before["title"]}
+        skipped = confirmation_only(thread, state, config)
         try:
             ensure_title_active(backend, thread_id, root)
-            candidate, usage = generator(before["context"])
+            if skipped:
+                candidate, usage = {"action": "keep", "title": before["title"], "reason": "新增内容仅为确认，保留稳定标题"}, {}
+            else:
+                candidate, usage = generator(before["context"])
         except ModelSkipped as exc:
             return {"status": exc.status}
         candidate = validate_candidate(candidate, before["title"])
@@ -363,6 +411,8 @@ def process_thread(backend, generator, thread_id, root, config, *, apply=False, 
             if candidate["action"] == "rename" and conflicting_titles(root, thread_id, candidate["title"], before["scope_key"]):
                 return {"status": "ambiguous_title", "title": before["title"], "usage": usage}
         result = {"status": "preview", **candidate, "usage": usage}
+        if skipped:
+            result["skip_reason"] = "confirmation_only"
         if not apply:
             return result
         # 模型运行期间用户可能发起下一轮、改名、暂停或锁定。
@@ -378,7 +428,9 @@ def process_thread(backend, generator, thread_id, root, config, *, apply=False, 
         if after["title"] != before["title"] or after["fingerprint"] != before["fingerprint"]:
             return {"status": "stale_result"}
         state.update(last_seen_title=before["title"], last_turn_id=before["latest_id"],
-                     scope_key=before["scope_key"], updated_at=int(time.time()))
+                     scope_key=before["scope_key"], updated_at=int(time.time()),
+                     policy_version=POLICY_VERSION,
+                     confirmation_skips=state.get("confirmation_skips", 0) + skipped if skipped else 0)
         if candidate["action"] == "rename" and candidate["title"] != before["title"]:
             state["pending_title"] = candidate["title"]
             atomic_json(path, state)
@@ -443,6 +495,7 @@ def main():
     p = sub.add_parser("doctor", help="只读检查运行环境")
     p.add_argument("--thread")
     sub.add_parser("status", help="显示配置和本地记录数量")
+    sub.add_parser("usage", help="汇总新版独立模型用量；缓存包含在输入中")
     sub.add_parser("pause", help="暂停自动命名")
     sub.add_parser("resume", help="恢复自动命名")
     p = sub.add_parser("configure", help="配置独立命名模型或兼容的可执行文件")
@@ -491,6 +544,9 @@ def main():
         if args.command == "status":
             print(json.dumps({"config": config, "data_dir": str(root),
                               "tracked_threads": len(list((root / "threads").glob("*.json")))}, ensure_ascii=False))
+            return 0
+        if args.command == "usage":
+            print(json.dumps(usage_report(root), ensure_ascii=False))
             return 0
         binary = find_codex(config["codex_bin"])
         if args.command == "doctor":
