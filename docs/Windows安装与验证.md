@@ -1,6 +1,6 @@
 # Windows 安装与验证
 
-Windows 版本沿用 Python 实现，没有额外的文件锁依赖。自动化测试、Windows CLI 真实 Stop 触发、Luna 调用和 App Server 标题读回均已验证；Windows 桌面端的自动触发与列表刷新尚未实测。
+Windows 版本沿用 Python 实现，没有额外的文件锁依赖。自动化测试、Windows CLI 真实 Stop 触发、Luna 调用和 App Server 标题读回均已验证；另有一条 Windows 桌面话题完成真实 Stop 改名和显示验收。置顶列表等其他显示状态尚未实测。
 
 ## 首次预检
 
@@ -46,7 +46,9 @@ py -3 scripts/oil_codex_title.py configure --codex-bin 'C:\Codex\codex.exe'
 
 2026-09-23 的本地 Windows CLI `0.156.1` 验收：新建测试对话后，首轮 Stop 确实触发并完成独立 Luna 调用，但宿主首次标题同时变化，插件记录 `stale_result` 且未写入；下一轮正常 Stop 记录 `renamed`，App Server 读回标题与日志一致，原对话没有额外命名消息。该证据只覆盖 CLI，不覆盖桌面侧边栏刷新。
 
-桌面端最终检查仍需在 Windows Codex 中完成：新建正常话题、结束一轮有具体目标的对话、检查后台日志与实际显示标题。没有这一步证据时，不宣称 Windows 桌面体验已经完整验收。
+同日用户完成一条 Windows 桌面话题的实测：插件日志记录 `renamed`，后续轮次记录 `kept`；App Server 读回的标题与用户提供的桌面截图一致。该证据确认这一话题的自动触发、持久标题和可见显示，不证明置顶列表、其他任务或所有桌面刷新场景均一致。文档不保存真实话题 ID、对话内容或截图路径。
+
+其他桌面状态仍需在 Windows Codex 中逐项检查：新建正常话题、结束一轮有具体目标的对话、核对后台日志、App Server 标题与实际显示。不要把单条话题的成功扩展为所有列表状态已经验收。
 
 首次验收按以下边界排查：`doctor` 失败先检查 CLI 路径、版本与 App Server；Hook 未 `ready` 时在 Codex CLI 输入 `/hooks`，选中本插件的 Stop Hook 后按 `t` 信任；`ready` 后仍要完成真实对话，等待日志出现 `renamed`，再用 `doctor --thread <话题 ID>` 读回相同标题。若独立模型超时，先检查 CLI 的网络或传输错误，最多恢复性重试一次，不要重复安装插件。`codex exec` 成功、手动运行脚本或仅有锁文件，都不能代替真实 Stop 验收。
 
